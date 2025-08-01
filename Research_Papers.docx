@@ -1,0 +1,38 @@
+# Research Papers
+
+## Papers Referenced in the Project
+
+### 1. Reliable Crowdsourcing and Deep Locality Preserving Learning for Unconstrained Facial Expression Recognition
+- **Authors**: Shan Li and Weihong Deng
+- **Publication**: IEEE Transactions on Image Processing
+- **Volume**: 28, Issue 1
+- **Pages**: 356-370
+- **Year**: 2019
+
+### 2. Attention Mechanism-based CNN for Facial Expression Recognition
+- **Authors**: Jing Li, Kan Jin, Dalin Zhou, Naoyuki Kubota, and Zhaojie Ju
+- **Publication**: Neurocomputing
+- **Volume**: 411
+- **Pages**: 340-350
+- **Year**: October 2020
+
+### 3. Lightweight Expression Recognition Combined Attention Fusion Network with Hybrid Knowledge Distillation for Occluded E-learner Facial Images
+- **Authors**: Yan Chen, Kexuan Li, Feng Tian, Ganglin Wei, and Morteza Seberi
+- **Publication**: Neurocomputing
+- **Volume**: 411
+- **Pages**: 340-350
+- **Year**: 2020
+
+### 4. Facial Expression Recognition With Visual Transformers and Attentional Selective Fusion
+- **Authors**: Fuyan Ma, Bin Sun, and Shutao Li
+- **Publication**: IEEE Transactions on Affective Computing
+- **Volume**: 14, Issue 2
+- **Pages**: 1236-1248
+- **Year**: 2023
+
+### 5. Spatial-Temporal Graphs Plus Transformers for Geometry-guided Facial Expression Recognition
+- **Authors**: Rui Zhao, Tianshan Liu, Zixun Huang, Daniel P.K. Lun, and Kin-Man Lam
+- **Publication**: IEEE Transactions on Affective Computing
+- **Volume**: 14, Issue 4
+- **Pages**: 2751-2767
+- **Year**: October-December 2023

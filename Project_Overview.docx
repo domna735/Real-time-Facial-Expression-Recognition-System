@@ -1,0 +1,58 @@
+# Project Overview
+
+## Real-time Facial Expression Recognition System
+
+### Description
+Facial expression recognition has a wide range of applications, including:
+- Human–computer interaction
+- Advertising
+- Entertainment
+
+This project focuses on detecting and analyzing human emotions through facial expressions. Various facial features and deep learning models will be studied to enhance recognition accuracy. To further improve performance:
+- Attention mechanisms will be applied to facial images and videos.
+- Lightweight models will be developed to optimize efficiency while maintaining accuracy.
+
+By the end of the project, a system capable of real-time facial expression recognition will be implemented.
+
+---
+
+### Ekman’s Six Basic Expressions
+Ekman’s six basic expressions (excluding the neutral expression):
+1. Happiness
+2. Sadness
+3. Anger
+4. Fear
+5. Surprise
+6. Disgust
+
+---
+
+### Steps for Facial Expression Recognition
+1. **Face Detection**
+   - Detect faces in images or video streams.
+2. **Deep Feature Extraction**
+   - Use attention mechanisms and knowledge distillation to learn from advanced models.
+3. **Classification**
+   - Classify facial expressions into predefined categories.
+
+---
+
+### Research Goals
+1. Study deep learning-based facial expression recognition methods.
+2. Investigate attention mechanisms and knowledge distillation methods to enhance recognition.
+3. Identify at least two datasets for the project.
+4. Evaluate at least three facial expression recognition methods.
+5. Explore techniques to enhance the performance of existing methods (optional).
+6. Present at least one paper on facial expression recognition by October 2025.
+
+---
+
+### References
+1. Shan Li and Weihong Deng, "Reliable Crowdsourcing and Deep Locality Preserving Learning for Unconstrained Facial Expression Recognition," IEEE Trans. on Image Processing, vol. 28, no. 1, pp. 356-370, 2019.
+2. Jing Li, Kan Jin, Dalin Zhou, Naoyuki Kubota, and Zhaojie Ju, "Attention mechanism-based CNN for facial expression recognition," Neurocomputing, vol. 411, pp. 340-350, October 2020.
+3. Yan Chen, Kexuan Li, Feng Tian, Ganglin Wei, and Morteza Seberi, "Lightweight expression recognition combined attention fusion network with hybrid knowledge distillation for occluded e-learner facial images," Neurocomputing, vol. 411, pp. 340-350, 2020.
+4. Fuyan Ma, Bin Sun, and Shutao Li, "Facial Expression Recognition With Visual Transformers and Attentional Selective Fusion," IEEE Trans. on Affective Computing, vol. 14, no. 2, pp. 1236-1248, 2023.
+5. Rui Zhao, Tianshan Liu, Zixun Huang, Daniel P.K. Lun, and Kin-Man Lam, "Spatial-Temporal Graphs Plus Transformers for Geometry-guided Facial Expression Recognition," IEEE Trans. on Affective Computing, vol. 14, no. 4, pp. 2751-2767, October-December 2023.
+
+
+python -c "from moviepy.editor import *; print('MoviePy is working')"
