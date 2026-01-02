@@ -1,0 +1,9 @@
+label,frames_with_manual,frames_with_manual_and_pred,correct_frames,accuracy
+Angry,252,252,42,0.166667
+Disgust,0,0,0,
+Fear,126,126,0,0.000000
+Happy,125,116,41,0.353448
+Sad,0,0,0,
+Surprise,205,205,121,0.590244
+Neutral,79,79,63,0.797468
+__overall__,787,778,267,0.343188

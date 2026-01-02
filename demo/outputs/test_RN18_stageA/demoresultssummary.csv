@@ -1,0 +1,2 @@
+time,input,detector,ckpt,model,frames_logged,events_logged,ema_alpha,hysteresis_delta,vote_window,vote_min_count
+2025-12-20 11:38:30,webcam:0,yunet,outputs\teachers\RN18_resnet18_seed1337_stageA_img224\best.pt,resnet18,1334,6,0.7,0.08,15,8

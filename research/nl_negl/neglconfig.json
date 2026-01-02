@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "description": "NegL scaffold config (complementary labels + gating).",
+  "enabled": false,
+  "mode": "complementary",
+  "weight": 0.2,
+  "apply_prob": 0.5,
+  "uncertainty_gate": {
+    "enabled": true,
+    "min_entropy": 1.0
+  },
+  "class_aware": {
+    "enabled": true,
+    "minority_classes": ["Disgust", "Fear", "Sad"],
+    "minority_ratio": 0.25,
+    "majority_ratio": 0.5
+  },
+  "sampling": {
+    "strategy": "uniform",
+    "teacher_guided": {
+      "enabled": false,
+      "confusion_matrix_path": null
+    }
+  }
+}

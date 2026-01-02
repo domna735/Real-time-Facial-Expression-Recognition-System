@@ -1,0 +1,7 @@
+{
+  "ema_alpha": 0.7,
+  "hysteresis_delta": 0.08,
+  "vote_window": 15,
+  "vote_min_count": 8,
+  "show_emo_ratio": true
+}
