@@ -26,5 +26,8 @@ def complementary_negative_loss(
     log_probs = F.log_softmax(logits, dim=1)
     nll_neg = -log_probs.gather(1, negative_y.view(-1, 1)).squeeze(1)
     if weight is not None:
-        nll_neg = nll_neg * weight
+        w = weight.to(nll_neg.dtype)
+        nll_neg = nll_neg * w
+        denom = w.sum().clamp_min(1e-12)
+        return nll_neg.sum() / denom
     return nll_neg.mean()

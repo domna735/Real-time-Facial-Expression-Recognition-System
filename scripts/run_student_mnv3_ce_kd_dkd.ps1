@@ -13,7 +13,7 @@ param(
 
     # Training
     [int]$BatchSize = 256,
-    [int]$NumWorkers = 2,
+    [int]$NumWorkers = 8,
     [switch]$UseAmp,
 
     # CE/KD/DKD schedule
@@ -21,10 +21,38 @@ param(
     [int]$KdEpochs = 20,
     [int]$DkdEpochs = 10,
 
+    # Optional: run DKD starting from an existing KD checkpoint.
+    # This enables fair DKD-only ablations (e.g., DKD 5 epochs) without re-running KD.
+    # Example:
+    #   -KdEpochs 0 -DkdEpochs 5 -DkdResumeFrom outputs/students/KD/.../checkpoint_last.pt
+    [string]$DkdResumeFrom = "",
+
     # KD/DKD hyperparams
     [double]$Temperature = 2.0,
     [double]$Alpha = 0.5,
     [double]$Beta = 4.0,
+
+    # NegL (optional)
+    [switch]$UseNegL,
+    [double]$NegLWeight = 0.1,
+    [double]$NegLRatio = 0.5,
+    [ValidateSet("none","entropy")][string]$NegLGate = "entropy",
+    [double]$NegLEntropyThresh = 0.7,
+
+    # NL (optional)
+    [switch]$UseNL,
+    [ValidateSet("proto","negl_gate")][string]$NLKind = "proto",
+    [ValidateSet("penultimate","logits")][string]$NLEmbed = "penultimate",
+    [int]$NLDim = 32,
+    [double]$NLMomentum = 0.9,
+    [ValidateSet("fixed","topk")][string]$NLProtoGate = "fixed",
+    [double]$NLConsistencyThresh = 0.2,
+    [double]$NLTopKFrac = 0.1,
+    [double]$NLWeight = 0.1,
+
+    # NL legacy (only used when NLKind=negl_gate)
+    [int]$NLHiddenDim = 32,
+    [int]$NLLayers = 1,
 
     # Smoke test controls
     [switch]$SmokeOnly,
@@ -32,6 +60,11 @@ param(
     [int]$SmokeEpochs = 1,
     [int]$SmokeBatchSize = 64,
     [int]$SmokeMaxValBatches = 2,
+
+    # Optional: auto-generate a comparison markdown after the run.
+    # Example: compare KD-only baseline vs existing KD+NegL run.
+    [string]$CompareWith = "",
+    [string]$CompareOut = "",
 
     # Repro
     [int]$Seed = 1337
@@ -146,7 +179,7 @@ $RepoRoot = Resolve-RepoRoot -Provided $RepoRoot
 $PythonExe = Resolve-PythonExe -Root $RepoRoot
 
 $stamp = Get-Date -Format yyyyMMdd_HHmmss
-$logRoot = Join-Path $RepoRoot ("outputs/students/_logs_" + $stamp)
+$logRoot = Join-Path $RepoRoot ("outputs/students/Log and test/_logs_" + $stamp)
 Ensure-Dir $logRoot
 
 $softlabelsDirAbs = Join-Path $RepoRoot $SoftlabelsDir
@@ -168,9 +201,16 @@ if (-not $SmokeOnly) {
 }
 
 # Fixed output dirs so DKD can resume automatically
-$ceOut = Join-Path $RepoRoot ("outputs/students/${Model}_img${ImageSize}_seed${Seed}_CE_" + $stamp)
-$kdOut = Join-Path $RepoRoot ("outputs/students/${Model}_img${ImageSize}_seed${Seed}_KD_" + $stamp)
-$dkdOut = Join-Path $RepoRoot ("outputs/students/${Model}_img${ImageSize}_seed${Seed}_DKD_" + $stamp)
+$ceOut = Join-Path $RepoRoot ("outputs/students/CE/${Model}_img${ImageSize}_seed${Seed}_CE_" + $stamp)
+$kdOut = Join-Path $RepoRoot ("outputs/students/KD/${Model}_img${ImageSize}_seed${Seed}_KD_" + $stamp)
+$dkdOut = Join-Path $RepoRoot ("outputs/students/DKD/${Model}_img${ImageSize}_seed${Seed}_DKD_" + $stamp)
+
+Write-Host "\nRun stamp: $stamp"
+Write-Host "Logs: $logRoot"
+Write-Host "Planned outputs:"
+Write-Host "  CE : $ceOut"
+Write-Host "  KD : $kdOut"
+Write-Host "  DKD: $dkdOut"
 
 function Build-CommonArgs {
     param([int]$Epochs,[int]$Bs,[int]$Workers,[string]$Mode,[string]$OutDir,[int]$MaxValBatches)
@@ -198,6 +238,33 @@ function Build-CommonArgs {
     }
     if ($MaxValBatches -gt 0) {
         $args += @("--max-val-batches", $MaxValBatches)
+    }
+
+    if ($UseNegL) {
+        $args += @(
+            "--use-negl",
+            "--negl-weight", $NegLWeight,
+            "--negl-ratio", $NegLRatio,
+            "--negl-gate", $NegLGate,
+            "--negl-entropy-thresh", $NegLEntropyThresh
+        )
+    }
+
+    if ($UseNL) {
+        $args += @("--use-nl", "--nl-kind", $NLKind)
+        if ($NLKind -eq "proto") {
+            $args += @(
+                "--nl-embed", $NLEmbed,
+                "--nl-dim", $NLDim,
+                "--nl-momentum", $NLMomentum,
+                "--nl-proto-gate", $NLProtoGate,
+                "--nl-consistency-thresh", $NLConsistencyThresh,
+                "--nl-topk-frac", $NLTopKFrac,
+                "--nl-weight", $NLWeight
+            )
+        } elseif ($NLKind -eq "negl_gate") {
+            $args += @("--nl-hidden-dim", $NLHiddenDim, "--nl-layers", $NLLayers)
+        }
     }
 
     return $args
@@ -252,9 +319,9 @@ function Get-CkptEpoch {
 # 1) Smoke test (fast sanity)
 if (-not $SkipSmoke) {
     $smokeStamp = Get-Date -Format yyyyMMdd_HHmmss
-    $smokeCeOut = Join-Path $RepoRoot ("outputs/students/_smoke_${Model}_CE_" + $smokeStamp)
-    $smokeKdOut = Join-Path $RepoRoot ("outputs/students/_smoke_${Model}_KD_" + $smokeStamp)
-    $smokeDkdOut = Join-Path $RepoRoot ("outputs/students/_smoke_${Model}_DKD_" + $smokeStamp)
+    $smokeCeOut = Join-Path $RepoRoot ("outputs/students/smoke/_smoke_${Model}_CE_" + $smokeStamp)
+    $smokeKdOut = Join-Path $RepoRoot ("outputs/students/smoke/_smoke_${Model}_KD_" + $smokeStamp)
+    $smokeDkdOut = Join-Path $RepoRoot ("outputs/students/smoke/_smoke_${Model}_DKD_" + $smokeStamp)
 
     $ceArgs = Build-CommonArgs -Epochs $SmokeEpochs -Bs $SmokeBatchSize -Workers 2 -Mode "ce" -OutDir $smokeCeOut -MaxValBatches $SmokeMaxValBatches
     Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "SMOKE CE" -ArgList $ceArgs -LogPath (Join-Path $logRoot "smoke_ce.txt")
@@ -281,31 +348,95 @@ if (-not $SkipSmoke) {
 }
 
 # 2) Full runs
-$ceArgsFull = Build-CommonArgs -Epochs $CeEpochs -Bs $BatchSize -Workers $NumWorkers -Mode "ce" -OutDir $ceOut -MaxValBatches 0
-Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "FULL CE" -ArgList $ceArgsFull -LogPath (Join-Path $logRoot "full_ce.txt")
-
-$kdArgsFull = Build-KDArgs -Mode "kd" -Epochs $KdEpochs -Bs $BatchSize -Workers $NumWorkers -OutDir $kdOut -MaxValBatches 0 -ResumeCkpt ""
-Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "FULL KD" -ArgList $kdArgsFull -LogPath (Join-Path $logRoot "full_kd.txt")
-
-$kdBest = Join-Path $kdOut "best.pt"
-if (-not (Test-Path -LiteralPath $kdBest)) {
-    $kdBest = Join-Path $kdOut "checkpoint_last.pt"
+if ($CeEpochs -gt 0) {
+    $ceArgsFull = Build-CommonArgs -Epochs $CeEpochs -Bs $BatchSize -Workers $NumWorkers -Mode "ce" -OutDir $ceOut -MaxValBatches 0
+    Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "FULL CE" -ArgList $ceArgsFull -LogPath (Join-Path $logRoot "full_ce.txt")
+} else {
+    Write-Host "\n==== FULL CE ===="
+    Write-Host "(skipped because -CeEpochs is 0)"
+    "SKIPPED (CeEpochs=0)" | Set-Content -LiteralPath (Join-Path $logRoot "full_ce.txt") -Encoding UTF8
 }
 
-$dkdArgsFull = Build-KDArgs -Mode "dkd" -Epochs $DkdEpochs -Bs $BatchSize -Workers $NumWorkers -OutDir $dkdOut -MaxValBatches 0 -ResumeCkpt $kdBest
-$dkdTotalEpochs = $DkdEpochs
-if ($kdBest -and (Test-Path -LiteralPath $kdBest)) {
-    $kdEpoch = Get-CkptEpoch -PythonExe $PythonExe -Root $RepoRoot -CkptPath $kdBest
-    if ($kdEpoch -ge 0) {
-        # Resume starts at (kdEpoch+1). We want DkdEpochs additional epochs.
-        $dkdTotalEpochs = $kdEpoch + 1 + $DkdEpochs
+$kdBest = ""
+if ($KdEpochs -gt 0) {
+    $kdArgsFull = Build-KDArgs -Mode "kd" -Epochs $KdEpochs -Bs $BatchSize -Workers $NumWorkers -OutDir $kdOut -MaxValBatches 0 -ResumeCkpt ""
+    Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "FULL KD" -ArgList $kdArgsFull -LogPath (Join-Path $logRoot "full_kd.txt")
+
+    $kdBest = Join-Path $kdOut "best.pt"
+    if (-not (Test-Path -LiteralPath $kdBest)) {
+        $kdBest = Join-Path $kdOut "checkpoint_last.pt"
     }
+} else {
+    Write-Host "\n==== FULL KD ===="
+    Write-Host "(skipped because -KdEpochs is 0)"
+    "SKIPPED (KdEpochs=0)" | Set-Content -LiteralPath (Join-Path $logRoot "full_kd.txt") -Encoding UTF8
 }
-$dkdArgsFull = Build-KDArgs -Mode "dkd" -Epochs $dkdTotalEpochs -Bs $BatchSize -Workers $NumWorkers -OutDir $dkdOut -MaxValBatches 0 -ResumeCkpt $kdBest
-Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "FULL DKD" -ArgList $dkdArgsFull -LogPath (Join-Path $logRoot "full_dkd.txt")
+
+if ($DkdResumeFrom) {
+    $dkdResumeAbs = $DkdResumeFrom
+    if (-not [System.IO.Path]::IsPathRooted($dkdResumeAbs)) {
+        $dkdResumeAbs = Join-Path $RepoRoot $DkdResumeFrom
+    }
+    if (-not (Test-Path -LiteralPath $dkdResumeAbs)) {
+        throw "DkdResumeFrom checkpoint not found: $dkdResumeAbs"
+    }
+    $kdBest = $dkdResumeAbs
+    Write-Host "Using DKD resume checkpoint: $kdBest"
+}
+
+if ($DkdEpochs -gt 0) {
+    if (-not $kdBest) {
+        throw "DKD requested but no resume checkpoint is available. Run KD first (KdEpochs>0) or provide -DkdResumeFrom <checkpoint_last.pt>."
+    }
+    $dkdArgsFull = Build-KDArgs -Mode "dkd" -Epochs $DkdEpochs -Bs $BatchSize -Workers $NumWorkers -OutDir $dkdOut -MaxValBatches 0 -ResumeCkpt $kdBest
+    $dkdTotalEpochs = $DkdEpochs
+    if ($kdBest -and (Test-Path -LiteralPath $kdBest)) {
+        $kdEpoch = Get-CkptEpoch -PythonExe $PythonExe -Root $RepoRoot -CkptPath $kdBest
+        if ($kdEpoch -ge 0) {
+            # Resume starts at (kdEpoch+1). We want DkdEpochs additional epochs.
+            $dkdTotalEpochs = $kdEpoch + 1 + $DkdEpochs
+        }
+    }
+    $dkdArgsFull = Build-KDArgs -Mode "dkd" -Epochs $dkdTotalEpochs -Bs $BatchSize -Workers $NumWorkers -OutDir $dkdOut -MaxValBatches 0 -ResumeCkpt $kdBest
+    Run-Student -PythonExe $PythonExe -Root $RepoRoot -Label "FULL DKD" -ArgList $dkdArgsFull -LogPath (Join-Path $logRoot "full_dkd.txt")
+} else {
+    Write-Host "\n==== FULL DKD ===="
+    Write-Host "(skipped because -DkdEpochs is 0)"
+    "SKIPPED (DkdEpochs=0)" | Set-Content -LiteralPath (Join-Path $logRoot "full_dkd.txt") -Encoding UTF8
+}
 
 Write-Host "\nAll done. Outputs:" 
 Write-Host "  CE : $ceOut"
 Write-Host "  KD : $kdOut"
 Write-Host "  DKD: $dkdOut"
 Write-Host "Logs: $logRoot"
+
+if ($CompareWith) {
+    $compareWithAbs = $CompareWith
+    if (-not [System.IO.Path]::IsPathRooted($compareWithAbs)) {
+        $compareWithAbs = Join-Path $RepoRoot $CompareWith
+    }
+    if (-not (Test-Path -LiteralPath $compareWithAbs)) {
+        Write-Host "CompareWith path not found; skipping compare: $compareWithAbs"
+        exit 0
+    }
+
+    $compareOutAbs = $CompareOut
+    if (-not $compareOutAbs) {
+        $compareOutAbs = Join-Path $RepoRoot "outputs/students/_compare_kd5_vs_negl5.md"
+    } elseif (-not [System.IO.Path]::IsPathRooted($compareOutAbs)) {
+        $compareOutAbs = Join-Path $RepoRoot $CompareOut
+    }
+    Ensure-Dir (Split-Path -Parent $compareOutAbs)
+
+    Write-Host "\n==== COMPARE RUNS ===="
+    Write-Host "CompareWith: $compareWithAbs"
+    Write-Host "Baseline KD: $kdOut"
+    Write-Host "Out: $compareOutAbs"
+
+    & $PythonExe tools/diagnostics/compare_student_runs.py `
+        $compareWithAbs $kdOut `
+        --label "CompareWith (reference)" `
+        --label "New run (this stamp)" `
+        --out $compareOutAbs
+}

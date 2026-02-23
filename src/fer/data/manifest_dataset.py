@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,10 @@ class ManifestRow:
     source: str
     # Optional ExpW-style bbox metadata (and similar). When present, the loader can crop faces on-the-fly.
     confidence: Optional[float] = None
+    # Optional per-sample positive loss weight (e.g., for pseudo-label training).
+    weight: Optional[float] = None
+    # Optional complementary label for NegL (string in CANONICAL_7). When present, training can penalize this class.
+    neg_label: Optional[str] = None
     orig_image: Optional[str] = None
     face_id: Optional[int] = None
     bbox_top: Optional[int] = None
@@ -97,6 +102,10 @@ def read_manifest(csv_path: Path) -> List[ManifestRow]:
                 except Exception:
                     return None
 
+            def _opt_str(key: str) -> Optional[str]:
+                v = (r.get(key) or "").strip()
+                return v or None
+
             rows.append(
                 ManifestRow(
                     image_path=(r.get("image_path") or "").strip(),
@@ -104,6 +113,8 @@ def read_manifest(csv_path: Path) -> List[ManifestRow]:
                     split=(r.get("split") or "").strip().lower(),
                     source=(r.get("source") or "").strip(),
                     confidence=_opt_float("confidence"),
+                    weight=_opt_float("weight"),
+                    neg_label=_opt_str("neg_label"),
                     orig_image=(r.get("orig_image") or "").strip() or None,
                     face_id=_opt_int("face_id"),
                     bbox_top=_opt_int("bbox_top"),
@@ -146,6 +157,8 @@ def build_splits(
                 split=split,
                 source=r.source,
                 confidence=r.confidence,
+                weight=r.weight,
+                neg_label=r.neg_label,
                 orig_image=r.orig_image,
                 face_id=r.face_id,
                 bbox_top=r.bbox_top,
@@ -215,11 +228,13 @@ class ManifestImageDataset(Dataset):
         out_root: Path,
         transform=None,
         return_path: bool = False,
+        return_meta: bool = False,
     ) -> None:
         self.rows = list(rows)
         self.out_root = out_root
         self.transform = transform if transform is not None else default_transform()
         self.return_path = bool(return_path)
+        self.return_meta = bool(return_meta)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -249,8 +264,23 @@ class ManifestImageDataset(Dataset):
             im = self.transform(im)
 
         y = LABEL_TO_INDEX[r.label]
+        meta = None
+        if self.return_meta:
+            neg_y = int(LABEL_TO_INDEX[r.neg_label]) if (r.neg_label is not None and r.neg_label in LABEL_TO_INDEX) else -1
+            conf = float(r.confidence) if (r.confidence is not None) else float("nan")
+            w = float(r.weight) if (r.weight is not None) else 1.0
+            meta = {
+                "confidence": conf,
+                "weight": float(w),
+                "neg_y": neg_y,
+            }
+
+        if self.return_path and self.return_meta:
+            return im, y, r.source, r.image_path, meta
         if self.return_path:
             return im, y, r.source, r.image_path
+        if self.return_meta:
+            return im, y, r.source, meta
         return im, y, r.source
 
 
