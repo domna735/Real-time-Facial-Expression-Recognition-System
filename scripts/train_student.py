@@ -8,8 +8,9 @@ import os
 import random
 import sys
 import time
+import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,8 @@ from src.fer.data.manifest_dataset import (  # noqa: E402
     build_splits,
     read_manifest,
 )
+from src.fer.nl.memory import AssociativeMemory  # noqa: E402
+from src.fer.negl.losses import complementary_negative_loss  # noqa: E402
 from src.fer.utils.device import get_best_device  # noqa: E402
 
 
@@ -282,14 +285,156 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=2.0)
     ap.add_argument("--mode", type=str, default="kd", choices=["ce", "kd", "dkd"])
 
+    # NegL (complementary-label negative learning) - optional auxiliary loss.
+    ap.add_argument("--use-negl", action="store_true")
+    ap.add_argument("--negl-weight", type=float, default=0.1, help="lambda: weight of NegL term")
+    ap.add_argument(
+        "--negl-ratio",
+        type=float,
+        default=0.5,
+        help="fraction of batch to apply NegL on (0..1); remaining samples have weight=0",
+    )
+    ap.add_argument("--negl-gate", type=str, default="entropy", choices=["none", "entropy"])
+    ap.add_argument(
+        "--negl-entropy-thresh",
+        type=float,
+        default=0.7,
+        help="apply NegL only when normalized entropy >= thresh (0..1), if gate=entropy",
+    )
+
+    # Optional: use extra manifest columns for self-learning buffers.
+    ap.add_argument(
+        "--manifest-use-weights",
+        action="store_true",
+        help="If set: use per-row 'weight' column as a per-sample weight for the CE term (defaults to 1.0 if missing).",
+    )
+    ap.add_argument(
+        "--manifest-use-neg-label",
+        action="store_true",
+        help=(
+            "If set: use per-row 'neg_label' column to define NegL targets (applies NegL only where provided; uses -1 sentinel otherwise)."
+        ),
+    )
+
+    # NL (two modes):
+    # - proto: prototype memory + momentum smoothing + consistency-gated auxiliary loss (stable default)
+    # - negl_gate: learned gate for NegL sample weights (legacy; kept for reproducibility)
+    ap.add_argument("--use-nl", action="store_true", help="Enable NL auxiliary module (see --nl-kind).")
+    ap.add_argument(
+        "--nl-kind",
+        type=str,
+        default="proto",
+        choices=["proto", "negl_gate"],
+        help="NL variant to use.",
+    )
+
+    # NL(proto)
+    ap.add_argument(
+        "--nl-embed",
+        type=str,
+        default="penultimate",
+        choices=["penultimate", "logits"],
+        help="Representation source for NL(proto): penultimate features (recommended) or logits (legacy).",
+    )
+    ap.add_argument("--nl-dim", type=int, default=32, help="Prototype memory dimension (32-64 recommended).")
+    ap.add_argument("--nl-momentum", type=float, default=0.9, help="EMA momentum for prototypes (0..1).")
+    ap.add_argument(
+        "--nl-proto-gate",
+        type=str,
+        default="fixed",
+        choices=["fixed", "topk"],
+        help="NL(proto) gating strategy: fixed threshold on (1-cos) vs top-k most inconsistent per batch.",
+    )
+    ap.add_argument(
+        "--nl-consistency-thresh",
+        type=float,
+        default=0.2,
+        help="Apply NL proto loss only when (1 - cosine_sim) >= thresh.",
+    )
+    ap.add_argument(
+        "--nl-topk-frac",
+        type=float,
+        default=0.1,
+        help="If --nl-proto-gate topk: target fraction of batch to apply NL on (0..1).",
+    )
+    ap.add_argument("--nl-weight", type=float, default=0.1, help="Weight of NL proto auxiliary loss.")
+
+    # NL(negl_gate) legacy args
+    ap.add_argument("--nl-hidden-dim", type=int, default=32)
+    ap.add_argument("--nl-layers", type=int, default=1)
+
+    # LP loss (Deep Locality-Preserving loss; Paper #5 Track A)
+    ap.add_argument(
+        "--lp-weight",
+        type=float,
+        default=0.0,
+        help="lambda: weight of locality-preserving (LP) loss term (0 disables)",
+    )
+    ap.add_argument(
+        "--lp-k",
+        type=int,
+        default=20,
+        help="k nearest neighbors within-class (batch approximation) for LP loss",
+    )
+    ap.add_argument(
+        "--lp-embed",
+        type=str,
+        default="penultimate",
+        choices=["penultimate", "logits"],
+        help="Representation source for LP loss.",
+    )
+
+    # Optional: after training, run the existing eval script to produce standard gate artifacts
+    # (outputs/evals/students/*/reliabilitymetrics.json) for eval-only + ExpW.
+    ap.add_argument(
+        "--post-eval",
+        action="store_true",
+        help="After training, evaluate best checkpoint on eval-only + ExpW using scripts/eval_student_checkpoint.py",
+    )
+    ap.add_argument(
+        "--post-eval-evalonly-manifest",
+        type=Path,
+        default=REPO_ROOT / "Training_data_cleaned" / "classification_manifest_eval_only.csv",
+    )
+    ap.add_argument(
+        "--post-eval-expw-manifest",
+        type=Path,
+        default=REPO_ROOT / "Training_data_cleaned" / "expw_full_manifest.csv",
+    )
+
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--resume", type=Path, default=None)
+
+    ap.add_argument(
+        "--init-from",
+        type=Path,
+        default=None,
+        help=(
+            "Initialize model weights from a checkpoint (.pt) and start fresh (no optimizer/scaler/epoch resume). "
+            "Use this for conservative fine-tuning / domain adaptation."
+        ),
+    )
+    ap.add_argument(
+        "--tune",
+        type=str,
+        default="all",
+        choices=["all", "head", "bn", "lastblock_head"],
+        help=(
+            "Which parameters to update. all=full training; head=classifier head only; bn=BatchNorm affine only; "
+            "lastblock_head=last backbone block + head (heuristic)."
+        ),
+    )
 
     ap.add_argument("--use-amp", action="store_true")
     ap.add_argument("--eval-every", type=int, default=1)
     ap.add_argument("--max-val-batches", type=int, default=0)
 
     args = ap.parse_args()
+
+    if bool(args.use_nl) and str(args.nl_kind) == "negl_gate" and (not bool(args.use_negl)):
+        raise SystemExit("--use-nl --nl-kind negl_gate requires --use-negl")
+    if bool(args.manifest_use_neg_label) and (not bool(args.use_negl)):
+        raise SystemExit("--manifest-use-neg-label requires --use-negl")
 
     random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
@@ -373,7 +518,14 @@ def main() -> int:
         clahe_tile=int(args.clahe_tile),
     )
 
-    train_ds = ManifestImageDataset(train_rows, out_root=args.data_root, transform=train_tf, return_path=True)
+    return_meta = bool(args.manifest_use_weights) or bool(args.manifest_use_neg_label)
+    train_ds = ManifestImageDataset(
+        train_rows,
+        out_root=args.data_root,
+        transform=train_tf,
+        return_path=True,
+        return_meta=return_meta,
+    )
     val_ds = ManifestImageDataset(val_rows, out_root=args.data_root, transform=val_tf)
 
     # Windows can hit "Couldn't open shared file mapping" (error 1455) when too many
@@ -397,13 +549,290 @@ def main() -> int:
     if num_workers > 0:
         train_dl_kwargs["prefetch_factor"] = prefetch_factor
         val_dl_kwargs["prefetch_factor"] = prefetch_factor
+        # Avoid re-spawning worker processes every epoch (especially important on Windows).
+        train_dl_kwargs["persistent_workers"] = True
+        val_dl_kwargs["persistent_workers"] = True
 
     train_dl = DataLoader(train_ds, **train_dl_kwargs)
     val_dl = DataLoader(val_ds, **val_dl_kwargs)
 
     # Student model
-    student = timm.create_model(str(args.model), pretrained=True, num_classes=len(CANONICAL_7)).to(device)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    # If we're initializing from an existing checkpoint, don't download pretrained weights.
+    use_pretrained = (args.init_from is None)
+    student = timm.create_model(str(args.model), pretrained=bool(use_pretrained), num_classes=len(CANONICAL_7)).to(device)
+
+    # Optional: initialize weights from an existing checkpoint but start fresh (no optimizer/scaler resume).
+    if args.init_from is not None:
+        init_path = Path(args.init_from)
+        if not init_path.exists():
+            raise SystemExit(f"--init-from checkpoint not found: {init_path}")
+        try:
+            init_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            init_ckpt = torch.load(init_path, map_location="cpu")
+        student.load_state_dict(init_ckpt.get("model", {}), strict=True)
+        print(f"[init-from] Loaded model weights from {init_path}")
+
+    def _infer_head_modules(model: nn.Module) -> List[nn.Module]:
+        mods: List[nn.Module] = []
+
+        # timm models often expose get_classifier() which returns a module or a name.
+        if hasattr(model, "get_classifier"):
+            try:
+                c = getattr(model, "get_classifier")()
+                if isinstance(c, str):
+                    m = getattr(model, c, None)
+                    if isinstance(m, nn.Module):
+                        mods.append(m)
+                elif isinstance(c, nn.Module):
+                    mods.append(c)
+                elif isinstance(c, (tuple, list)):
+                    for item in c:
+                        if isinstance(item, str):
+                            m = getattr(model, item, None)
+                            if isinstance(m, nn.Module):
+                                mods.append(m)
+                        elif isinstance(item, nn.Module):
+                            mods.append(item)
+            except Exception:
+                pass
+
+        # Heuristic fallbacks.
+        for attr in ("classifier", "fc", "head"):
+            m = getattr(model, attr, None)
+            if isinstance(m, nn.Module):
+                mods.append(m)
+
+        # Dedupe while preserving order.
+        seen: set[int] = set()
+        out: List[nn.Module] = []
+        for m in mods:
+            mid = id(m)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append(m)
+        return out
+
+    def _infer_last_block_module(model: nn.Module) -> Optional[nn.Module]:
+        # Common timm patterns.
+        for attr in ("blocks", "stages", "layers"):
+            m = getattr(model, attr, None)
+            if isinstance(m, nn.ModuleList) and len(m) > 0:
+                return m[-1]
+            if isinstance(m, (list, tuple)) and len(m) > 0 and isinstance(m[-1], nn.Module):
+                return m[-1]
+
+        # ResNet-like.
+        for attr in ("layer4", "stage4", "layer3"):
+            m = getattr(model, attr, None)
+            if isinstance(m, nn.Module):
+                return m
+
+        # MobileNet/EfficientNet-like.
+        m = getattr(model, "features", None)
+        if isinstance(m, nn.Sequential) and len(m) > 0:
+            return m[-1]
+
+        return None
+
+    def _apply_tune_policy(model: nn.Module, tune: str) -> None:
+        tune = str(tune)
+
+        # Default: everything trainable.
+        for p in model.parameters():
+            p.requires_grad = True
+        if tune == "all":
+            return
+
+        # Freeze everything first.
+        for p in model.parameters():
+            p.requires_grad = False
+
+        if tune == "bn":
+            for mod in model.modules():
+                if isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    for p in mod.parameters(recurse=False):
+                        p.requires_grad = True
+            return
+
+        # Head-only or last-block+head.
+        head_mods = _infer_head_modules(model)
+        for hm in head_mods:
+            for p in hm.parameters():
+                p.requires_grad = True
+
+        if tune == "lastblock_head":
+            last_block = _infer_last_block_module(model)
+            if last_block is None:
+                print("[tune] lastblock_head requested but last block not found; falling back to head-only")
+            else:
+                for p in last_block.parameters():
+                    p.requires_grad = True
+
+    _apply_tune_policy(student, str(args.tune))
+
+    def _freeze_bn_running_stats(model: nn.Module) -> None:
+        """Keep BatchNorm layers in eval mode to avoid drifting running stats.
+
+        Important for conservative fine-tuning / domain adaptation on small buffers
+        (e.g., webcam self-learning), where updating BN running_mean/var can cause
+        large distribution shifts and harm generalization.
+        """
+
+        for mod in model.modules():
+            if isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                mod.eval()
+
+    def _nl_extract_penultimate_and_logits(
+        model: nn.Module, x: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return (logits, penultimate) if available; otherwise None.
+
+        Uses timm-style forward_features/forward_head when present. The penultimate output
+        is forced to be 2D (B, D).
+        """
+
+        if not hasattr(model, "forward_features"):
+            return None
+
+        forward_features = getattr(model, "forward_features")
+        feats = forward_features(x)
+        if hasattr(model, "forward_head"):
+            forward_head = getattr(model, "forward_head")
+            pre = forward_head(feats, pre_logits=True)
+            logits = forward_head(feats, pre_logits=False)
+        else:
+            # Fallback: derive a pooled vector from forward_features output.
+            if isinstance(feats, (tuple, list)):
+                feats = feats[-1]
+            if not isinstance(feats, torch.Tensor):
+                return None
+            if feats.ndim == 4:
+                pre = feats.mean(dim=(2, 3))
+            elif feats.ndim == 3:
+                pre = feats.mean(dim=1)
+            else:
+                pre = feats.flatten(1)
+            # Worst-case: compute logits via full forward (extra compute).
+            logits = model(x)
+
+        if isinstance(pre, torch.Tensor) and pre.ndim > 2:
+            pre = pre.flatten(1)
+        if not (isinstance(pre, torch.Tensor) and isinstance(logits, torch.Tensor)):
+            return None
+        return logits, pre
+
+    def _lp_loss_batch(
+        feats: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        k: int,
+    ) -> Tuple[torch.Tensor, float]:
+        """Compute the locality-preserving loss (LP loss) on a mini-batch.
+
+        Paper form (mini-batch-friendly approximation):
+
+            L_lp = (1 / (2n)) * sum_i || x_i - (1/k) * sum_{x in N_k{x_i}} x ||_2^2
+
+        Here N_k{x_i} is the set of k-nearest neighbors within the same class.
+        We approximate neighbors within the current batch.
+
+        Returns: (lp_loss, included_frac)
+        where included_frac is the fraction of batch samples with >=1 same-class neighbor.
+        """
+
+        if not isinstance(feats, torch.Tensor) or feats.ndim != 2:
+            raise ValueError("feats must be a 2D Tensor (B, D)")
+
+        bs = int(feats.shape[0])
+        if bs <= 1:
+            z = feats.sum() * 0.0
+            return z, 0.0
+
+        k = int(k)
+        if k < 1:
+            z = feats.sum() * 0.0
+            return z, 0.0
+
+        feats_f = feats.float()
+        y = y.long()
+
+        total = torch.zeros((), device=feats.device, dtype=feats_f.dtype)
+        n_total = 0
+
+        # Process per class to keep neighbor search intra-class.
+        for cls in torch.unique(y.detach()):
+            mask = (y == cls)
+            n = int(mask.sum().item())
+            if n < 2:
+                continue
+            idx = mask.nonzero(as_tuple=True)[0]
+            f = feats_f.index_select(0, idx)  # (n, D)
+
+            kk = min(k, n - 1)
+            # Pairwise squared L2 distances.
+            dist = torch.cdist(f, f, p=2).pow(2)
+            # Exclude self from neighbor list.
+            dist.fill_diagonal_(float("inf"))
+            nn_idx = torch.topk(dist, k=kk, largest=False, dim=1).indices  # (n, kk)
+            nn_mean = f[nn_idx].mean(dim=1)  # (n, D)
+
+            diff = (f - nn_mean)
+            total = total + diff.pow(2).sum(dim=1).sum()
+            n_total += n
+
+        if n_total == 0:
+            z = feats.sum() * 0.0
+            return z, 0.0
+
+        lp = 0.5 * total / float(n_total)
+        included_frac = float(n_total) / float(max(1, bs))
+        return lp.to(feats.dtype), included_frac
+
+    # NL state
+    nl_kind = str(args.nl_kind)
+    nl_gate_memory: Optional[AssociativeMemory] = None
+    nl_proj: Optional[nn.Linear] = None
+    nl_prototypes: Optional[torch.Tensor] = None
+    nl_seen: Optional[torch.Tensor] = None
+
+    if bool(args.use_nl) and nl_kind == "negl_gate":
+        # Features: [entropy_norm, max_prob, margin, step_frac]
+        nl_gate_memory = AssociativeMemory(hidden_dim=int(args.nl_hidden_dim), layers=int(args.nl_layers), input_dim=4).to(
+            device
+        )
+
+    if bool(args.use_nl) and nl_kind == "proto":
+        nl_embed = str(args.nl_embed)
+        if nl_embed == "penultimate":
+            # Infer penultimate feature dimension with a tiny dummy forward.
+            student_was_training = student.training
+            student.eval()
+            with torch.no_grad():
+                dummy = torch.zeros((1, 3, int(args.image_size), int(args.image_size)), device=device)
+                out = _nl_extract_penultimate_and_logits(student, dummy)
+                feat_dim = int(out[1].shape[1]) if out is not None else int(getattr(student, "num_features", 0) or 0)
+            student.train(student_was_training)
+            if feat_dim <= 0:
+                feat_dim = int(len(CANONICAL_7))
+        else:
+            feat_dim = int(len(CANONICAL_7))
+        nl_dim = int(args.nl_dim)
+        if nl_dim < 1:
+            raise SystemExit("--nl-dim must be >= 1")
+
+        nl_proj = nn.Linear(feat_dim, nl_dim).to(device)
+        nl_prototypes = torch.zeros((len(CANONICAL_7), nl_dim), device=device, dtype=torch.float32)
+        nl_seen = torch.zeros((len(CANONICAL_7),), device=device, dtype=torch.int64)
+
+    params = [p for p in student.parameters() if p.requires_grad]
+    if nl_gate_memory is not None:
+        params += list(nl_gate_memory.parameters())
+    if nl_proj is not None:
+        params += list(nl_proj.parameters())
+
+    optimizer = torch.optim.AdamW(params, lr=float(args.lr), weight_decay=float(args.weight_decay))
     scaler = GradScaler("cuda", enabled=use_amp)
 
     global_step = 0
@@ -412,10 +841,39 @@ def main() -> int:
     best_epoch = -1
 
     def save_ckpt(path: Path, *, epoch: int) -> None:
+        nl_ckpt: Optional[Dict[str, Any]] = None
+        if bool(args.use_nl) and nl_kind == "proto" and nl_proj is not None and nl_prototypes is not None and nl_seen is not None:
+            nl_ckpt = {
+                "kind": "proto",
+                "proj": nl_proj.state_dict(),
+                "prototypes": nl_prototypes.detach().float().cpu(),
+                "seen": nl_seen.detach().cpu(),
+                "cfg": {
+                    "embed": str(args.nl_embed),
+                    "feat_dim": int(nl_proj.in_features),
+                    "dim": int(args.nl_dim),
+                    "momentum": float(args.nl_momentum),
+                    "proto_gate": str(args.nl_proto_gate),
+                    "consistency_thresh": float(args.nl_consistency_thresh),
+                    "topk_frac": float(args.nl_topk_frac),
+                    "weight": float(args.nl_weight),
+                },
+            }
+        elif bool(args.use_nl) and nl_kind == "negl_gate" and nl_gate_memory is not None:
+            nl_ckpt = {
+                "kind": "negl_gate",
+                "memory": nl_gate_memory.state_dict(),
+                "cfg": {"hidden_dim": int(args.nl_hidden_dim), "layers": int(args.nl_layers)},
+            }
+
         ckpt = {
             "epoch": int(epoch),
             "global_step": int(global_step),
             "model": student.state_dict(),
+            # Backward-compat: legacy key used by NL(negl_gate)
+            "nl_memory": (nl_gate_memory.state_dict() if nl_gate_memory is not None else None),
+            # New structured NL checkpoint payload
+            "nl": nl_ckpt,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "args": vars(args),
@@ -438,10 +896,55 @@ def main() -> int:
         except TypeError:
             ckpt = torch.load(ckpt_path, map_location="cpu")
         student.load_state_dict(ckpt.get("model", {}), strict=True)
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt:
-            scaler.load_state_dict(ckpt["scaler"])
+
+        # NL resume
+        ckpt_nl = ckpt.get("nl")
+        if bool(args.use_nl) and isinstance(ckpt_nl, dict):
+            if nl_kind == "proto" and str(ckpt_nl.get("kind")) == "proto":
+                if nl_proj is not None and isinstance(ckpt_nl.get("proj"), dict):
+                    try:
+                        nl_proj.load_state_dict(ckpt_nl["proj"], strict=True)
+                    except Exception as e:
+                        print(f"[NL] Skipping proj resume due to shape mismatch: {e}")
+                if nl_prototypes is not None and isinstance(ckpt_nl.get("prototypes"), torch.Tensor):
+                    pt = ckpt_nl["prototypes"].detach().float()
+                    if pt.shape == nl_prototypes.shape:
+                        nl_prototypes.copy_(pt.to(device))
+                if nl_seen is not None and isinstance(ckpt_nl.get("seen"), torch.Tensor):
+                    se = ckpt_nl["seen"].detach().to(torch.int64)
+                    if se.shape == nl_seen.shape:
+                        nl_seen.copy_(se.to(device))
+            elif nl_kind == "negl_gate" and str(ckpt_nl.get("kind")) == "negl_gate":
+                if nl_gate_memory is not None and isinstance(ckpt_nl.get("memory"), dict):
+                    nl_gate_memory.load_state_dict(ckpt_nl["memory"], strict=True)
+
+        # Backward-compat: legacy NL(negl_gate) checkpoints
+        if bool(args.use_nl) and nl_kind == "negl_gate" and nl_gate_memory is not None and isinstance(ckpt.get("nl_memory"), dict):
+            nl_gate_memory.load_state_dict(ckpt["nl_memory"], strict=True)
+
+        # Optimizer/scaler resume:
+        # When resuming across stages (e.g., KD -> DKD), we intentionally DO NOT restore
+        # optimizer/scaler state. This avoids parameter-group mismatches and is closer to
+        # the intended meaning of "continue training weights under a new loss".
+        ckpt_args = ckpt.get("args") if isinstance(ckpt.get("args"), dict) else {}
+        ckpt_mode = ckpt_args.get("mode")
+        same_mode = (ckpt_mode is None) or (str(ckpt_mode) == str(args.mode))
+        if str(args.tune) != "all":
+            same_mode = False
+            print(f"[resume] tune={args.tune}: skipping optimizer/scaler resume (fresh fine-tune optimizer)")
+        if same_mode:
+            if "optimizer" in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer"])
+                except ValueError as e:
+                    print(f"[resume] Skipping optimizer state due to incompatibility: {e}")
+            if "scaler" in ckpt:
+                try:
+                    scaler.load_state_dict(ckpt["scaler"])
+                except Exception as e:
+                    print(f"[resume] Skipping scaler state due to incompatibility: {e}")
+        else:
+            print(f"[resume] Checkpoint mode={ckpt_mode} != current mode={args.mode}; skipping optimizer/scaler resume")
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
         best = ckpt.get("best") or {}
@@ -502,11 +1005,27 @@ def main() -> int:
     # Training loop
     for epoch in range(start_epoch, int(args.epochs)):
         student.train()
+        if str(args.tune) != "all":
+            _freeze_bn_running_stats(student)
         epoch_loss = 0.0
+        epoch_negl = 0.0
+        epoch_negl_applied = 0.0
+        epoch_negl_entropy = 0.0
+        epoch_nl_gate = 0.0
+        epoch_nl_gate_applied = 0.0
+        epoch_nl_proto_loss = 0.0
+        epoch_nl_proto_applied = 0.0
+        epoch_nl_proto_sim = 0.0
+        epoch_lp_loss = 0.0
+        epoch_lp_included = 0.0
         t_epoch = time.time()
 
         for step, batch in enumerate(train_dl):
-            x, y, _src, rel_path = batch
+            meta = None
+            if return_meta:
+                x, y, _src, rel_path, meta = batch
+            else:
+                x, y, _src, rel_path = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
@@ -516,8 +1035,32 @@ def main() -> int:
                 pg["lr"] = lr
 
             with autocast(autocast_device, enabled=use_amp):
-                student_logits = student(x)
-                ce = F.cross_entropy(student_logits, y)
+                nl_penultimate: Optional[torch.Tensor] = None
+                lp_penultimate: Optional[torch.Tensor] = None
+
+                need_penultimate = (
+                    (bool(args.use_nl) and nl_kind == "proto" and str(args.nl_embed) == "penultimate" and nl_proj is not None)
+                    or (float(args.lp_weight) != 0.0 and str(args.lp_embed) == "penultimate")
+                )
+                if need_penultimate:
+                    out = _nl_extract_penultimate_and_logits(student, x)
+                    if out is not None:
+                        student_logits, lp_penultimate = out
+                        # Reuse for NL(proto) if requested.
+                        if bool(args.use_nl) and nl_kind == "proto" and str(args.nl_embed) == "penultimate" and nl_proj is not None:
+                            nl_penultimate = lp_penultimate
+                    else:
+                        student_logits = student(x)
+                else:
+                    student_logits = student(x)
+                if meta is not None and bool(args.manifest_use_weights):
+                    ce_per = F.cross_entropy(student_logits, y, reduction="none")
+                    w = meta["weight"].to(device=device, dtype=ce_per.dtype)
+                    w = w.clamp_min(0.0)
+                    denom = w.sum().clamp_min(1e-12)
+                    ce = (ce_per * w).sum() / denom
+                else:
+                    ce = F.cross_entropy(student_logits, y)
 
                 loss = ce
                 if args.mode != "ce":
@@ -542,12 +1085,186 @@ def main() -> int:
                     alpha = float(args.alpha)
                     loss = (1.0 - alpha) * ce + alpha * (t * t) * distill
 
+                negl_loss_val = None
+                negl_applied_frac = None
+                negl_entropy_mean = None
+                nl_gate_mean = None
+                nl_gate_applied_mean = None
+
+                nl_proto_loss_val = None
+                nl_proto_applied_frac = None
+                nl_proto_sim_mean = None
+
+                lp_loss_val = None
+                lp_included_frac = None
+
+                # NL(proto): prototype memory with momentum smoothing + consistency gating.
+                if bool(args.use_nl) and nl_kind == "proto" and nl_proj is not None and nl_prototypes is not None and nl_seen is not None:
+                    nl_w = float(args.nl_weight)
+                    if nl_w != 0.0:
+                        rep = nl_penultimate if nl_penultimate is not None else student_logits.float()
+                        z = nl_proj(rep.float())
+                        z = F.normalize(z, dim=1, eps=1e-6)
+
+                        proto_y = nl_prototypes[y].to(z.dtype)
+                        proto_y = F.normalize(proto_y, dim=1, eps=1e-6)
+                        sim = F.cosine_similarity(z, proto_y, dim=1).clamp(-1.0, 1.0)
+                        incons = (1.0 - sim)
+
+                        gate = str(args.nl_proto_gate)
+                        if gate == "topk":
+                            frac = float(args.nl_topk_frac)
+                            frac = max(0.0, min(1.0, frac))
+                            bs = int(incons.shape[0])
+                            k = int(math.ceil(frac * float(bs)))
+                            if k <= 0:
+                                nl_apply = torch.zeros_like(incons, dtype=z.dtype)
+                            else:
+                                k = min(bs, k)
+                                with torch.no_grad():
+                                    idx = torch.topk(incons.detach(), k=k, largest=True, sorted=False).indices
+                                nl_apply = torch.zeros_like(incons, dtype=z.dtype)
+                                nl_apply[idx] = 1.0
+                        else:
+                            thr = float(args.nl_consistency_thresh)
+                            thr = max(0.0, min(2.0, thr))
+                            nl_apply = (incons >= thr).to(z.dtype)
+
+                        nl_loss = (nl_apply * incons).mean()
+                        loss = loss + nl_w * nl_loss
+
+                        nl_proto_loss_val = float(nl_loss.detach().cpu().item())
+                        nl_proto_applied_frac = float(nl_apply.detach().mean().cpu().item())
+                        nl_proto_sim_mean = float(sim.detach().mean().cpu().item())
+
+                        # Momentum update prototypes using batch embeddings.
+                        with torch.no_grad():
+                            m = float(args.nl_momentum)
+                            m = max(0.0, min(1.0, m))
+                            for cls in torch.unique(y.detach()):
+                                cls_i = int(cls.item())
+                                mask_c = (y == cls)
+                                if not bool(mask_c.any()):
+                                    continue
+                                mean_z = z.detach()[mask_c].mean(dim=0)
+                                mean_z = F.normalize(mean_z, dim=0, eps=1e-6)
+                                if int(nl_seen[cls_i].item()) == 0:
+                                    nl_prototypes[cls_i].copy_(mean_z.to(nl_prototypes.dtype))
+                                else:
+                                    nl_prototypes[cls_i].mul_(m).add_((1.0 - m) * mean_z.to(nl_prototypes.dtype))
+                                nl_seen[cls_i] += int(mask_c.sum().item())
+
+                # LP loss (Paper #5 Track A): supervised locality preserving loss in feature space.
+                lp_w = float(args.lp_weight)
+                if lp_w != 0.0:
+                    rep: torch.Tensor
+                    if str(args.lp_embed) == "penultimate":
+                        rep = lp_penultimate if lp_penultimate is not None else student_logits
+                    else:
+                        rep = student_logits
+                    if rep.ndim > 2:
+                        rep = rep.flatten(1)
+                    lp_loss, lp_frac = _lp_loss_batch(rep, y, k=int(args.lp_k))
+                    loss = loss + lp_w * lp_loss
+                    lp_loss_val = float(lp_loss.detach().cpu().item())
+                    lp_included_frac = float(lp_frac)
+                if bool(args.use_negl):
+                    c = int(student_logits.shape[1])
+                    bs = int(y.shape[0])
+
+                    # Select subset by ratio.
+                    ratio = float(args.negl_ratio)
+                    ratio = max(0.0, min(1.0, ratio))
+                    apply_mask = (torch.rand((bs,), device=device) < ratio)
+
+                    use_manifest_neg = bool(args.manifest_use_neg_label) and (meta is not None)
+                    if use_manifest_neg:
+                        neg_y_raw = meta["neg_y"].to(device=device)
+                        has_neg = (neg_y_raw >= 0)
+                        # Replace missing neg_y with a safe value; weight will be forced to 0 by apply_mask.
+                        neg_y = torch.where(has_neg, neg_y_raw, torch.zeros_like(neg_y_raw))
+                        apply_mask = apply_mask & has_neg
+                    else:
+                        # Sample a complementary label (uniform wrong class).
+                        neg_y = torch.randint(0, c - 1, (bs,), device=device)
+                        neg_y = neg_y + (neg_y >= y).to(neg_y.dtype)
+
+                    # Optional entropy gate: apply NegL only for uncertain predictions.
+                    if str(args.negl_gate) == "entropy":
+                        with torch.no_grad():
+                            p = F.softmax(student_logits.detach().float(), dim=1).clamp_min(1e-12)
+                            ent = -(p * p.log()).sum(dim=1)
+                            ent_norm = ent / float(math.log(max(2, c)))
+                            thr = float(args.negl_entropy_thresh)
+                            thr = max(0.0, min(1.0, thr))
+                            apply_mask = apply_mask & (ent_norm >= thr)
+                            negl_entropy_mean = float(ent_norm.mean().detach().cpu().item())
+
+                    w = apply_mask.to(student_logits.dtype)
+                    if nl_gate_memory is not None:
+                        # Learn a per-sample gate to weight NegL.
+                        with torch.no_grad():
+                            p = F.softmax(student_logits.detach().float(), dim=1).clamp_min(1e-12)
+                            p_sorted, _ = p.sort(dim=1, descending=True)
+                            max_prob = p_sorted[:, 0]
+                            margin = p_sorted[:, 0] - p_sorted[:, 1]
+                            ent = -(p * p.log()).sum(dim=1)
+                            ent_norm = ent / float(math.log(max(2, c)))
+                            step_frac = torch.full(
+                                (bs,),
+                                float(global_step) / float(max(1, total_steps)),
+                                device=device,
+                                dtype=p.dtype,
+                            )
+                            feats = torch.stack([ent_norm, max_prob, margin, step_frac], dim=1)
+
+                        gate = nl_gate_memory(feats).squeeze(1).to(student_logits.dtype)
+                        w = w * gate
+
+                        nl_gate_mean = float(gate.detach().mean().cpu().item())
+                        if apply_mask.any():
+                            nl_gate_applied_mean = float(gate.detach()[apply_mask].mean().cpu().item())
+                        else:
+                            nl_gate_applied_mean = 0.0
+
+                    negl = complementary_negative_loss(student_logits, neg_y, weight=w)
+                    lam = float(args.negl_weight)
+                    if lam != 0.0:
+                        loss = loss + lam * negl
+
+                    negl_loss_val = float(negl.detach().cpu().item())
+                    negl_applied_frac = float(apply_mask.to(torch.float32).mean().detach().cpu().item())
+                    if nl_gate_mean is not None:
+                        nl_gate_mean = float(nl_gate_mean)
+                    if nl_gate_applied_mean is not None:
+                        nl_gate_applied_mean = float(nl_gate_applied_mean)
+
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += float(loss.detach().cpu().item())
+            if negl_loss_val is not None:
+                epoch_negl += float(negl_loss_val)
+            if negl_applied_frac is not None:
+                epoch_negl_applied += float(negl_applied_frac)
+            if negl_entropy_mean is not None:
+                epoch_negl_entropy += float(negl_entropy_mean)
+            if nl_gate_mean is not None:
+                epoch_nl_gate += float(nl_gate_mean)
+            if nl_gate_applied_mean is not None:
+                epoch_nl_gate_applied += float(nl_gate_applied_mean)
+            if nl_proto_loss_val is not None:
+                epoch_nl_proto_loss += float(nl_proto_loss_val)
+            if nl_proto_applied_frac is not None:
+                epoch_nl_proto_applied += float(nl_proto_applied_frac)
+            if nl_proto_sim_mean is not None:
+                epoch_nl_proto_sim += float(nl_proto_sim_mean)
+            if lp_loss_val is not None:
+                epoch_lp_loss += float(lp_loss_val)
+            if lp_included_frac is not None:
+                epoch_lp_included += float(lp_included_frac)
             global_step += 1
 
         epoch_sec = time.time() - t_epoch
@@ -561,6 +1278,53 @@ def main() -> int:
             "epoch_sec": float(epoch_sec),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
+
+        if bool(args.use_negl):
+            rec["negl"] = {
+                "weight": float(args.negl_weight),
+                "ratio": float(args.negl_ratio),
+                "gate": str(args.negl_gate),
+                "entropy_thresh": float(args.negl_entropy_thresh),
+                "train_negl_loss": float(epoch_negl / max(1, len(train_dl))),
+                "applied_frac": float(epoch_negl_applied / max(1, len(train_dl))),
+                "entropy_mean": float(epoch_negl_entropy / max(1, len(train_dl))) if epoch_negl_entropy > 0 else None,
+            }
+
+        if bool(args.use_nl):
+            if nl_kind == "negl_gate" and nl_gate_memory is not None:
+                rec["nl"] = {
+                    "enabled": True,
+                    "kind": "negl_gate",
+                    "hidden_dim": int(args.nl_hidden_dim),
+                    "layers": int(args.nl_layers),
+                    "gate_mean": float(epoch_nl_gate / max(1, len(train_dl))),
+                    "gate_applied_mean": float(epoch_nl_gate_applied / max(1, len(train_dl))),
+                }
+            elif nl_kind == "proto" and nl_proj is not None:
+                rec["nl"] = {
+                    "enabled": True,
+                    "kind": "proto",
+                    "embed": str(args.nl_embed),
+                    "dim": int(args.nl_dim),
+                    "momentum": float(args.nl_momentum),
+                    "proto_gate": str(args.nl_proto_gate),
+                    "consistency_thresh": float(args.nl_consistency_thresh),
+                    "topk_frac": float(args.nl_topk_frac),
+                    "weight": float(args.nl_weight),
+                    "train_nl_loss": float(epoch_nl_proto_loss / max(1, len(train_dl))),
+                    "applied_frac": float(epoch_nl_proto_applied / max(1, len(train_dl))),
+                    "sim_mean": float(epoch_nl_proto_sim / max(1, len(train_dl))),
+                }
+
+        if float(args.lp_weight) != 0.0:
+            rec["lp"] = {
+                "enabled": True,
+                "weight": float(args.lp_weight),
+                "k": int(args.lp_k),
+                "embed": str(args.lp_embed),
+                "train_lp_loss": float(epoch_lp_loss / max(1, len(train_dl))),
+                "included_frac": float(epoch_lp_included / max(1, len(train_dl))),
+            }
 
         if int(args.eval_every) and ((epoch + 1) % int(args.eval_every) == 0):
             eval_payload = eval_student()
@@ -579,6 +1343,73 @@ def main() -> int:
         )
 
     print(f"Done. Output: {args.output_dir}")
+
+    # Optional: produce standard gate artifacts (eval-only + ExpW) by running the existing eval script.
+    if bool(args.post_eval):
+        ckpt = args.output_dir / "best.pt"
+        if not ckpt.exists():
+            ckpt = args.output_dir / "checkpoint_last.pt"
+
+        post_eval_results: List[Dict[str, object]] = []
+        eval_jobs = [
+            {"name": "eval_only", "manifest": Path(args.post_eval_evalonly_manifest)},
+            {"name": "expw", "manifest": Path(args.post_eval_expw_manifest)},
+        ]
+
+        for job in eval_jobs:
+            manifest = Path(job["manifest"])  # type: ignore[arg-type]
+            if not manifest.exists():
+                post_eval_results.append({"name": job["name"], "ok": False, "error": f"manifest not found: {manifest}"})
+                continue
+
+            cmd = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "eval_student_checkpoint.py"),
+                "--checkpoint",
+                str(ckpt),
+                "--eval-manifest",
+                str(manifest),
+                "--eval-split",
+                "test",
+                "--eval-data-root",
+                str(args.data_root),
+                "--batch-size",
+                str(int(args.batch_size)),
+                "--num-workers",
+                str(int(args.num_workers)),
+                "--seed",
+                str(int(args.seed)),
+            ]
+
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            rec_job: Dict[str, object] = {
+                "name": job["name"],
+                "manifest": str(manifest),
+                "checkpoint": str(ckpt),
+                "returncode": int(r.returncode),
+            }
+            if r.returncode == 0:
+                # Try parse the JSON printed by eval_student_checkpoint.py.
+                out_dir = None
+                try:
+                    last = (r.stdout or "").strip().splitlines()[-1]
+                    payload = json.loads(last)
+                    if isinstance(payload, dict) and "out_dir" in payload:
+                        out_dir = payload.get("out_dir")
+                        rec_job["out_dir"] = out_dir
+                        rec_job["raw"] = payload.get("raw")
+                        rec_job["ts"] = payload.get("ts")
+                except Exception:
+                    pass
+                rec_job["ok"] = True
+            else:
+                rec_job["ok"] = False
+                rec_job["stderr"] = (r.stderr or "")[:4000]
+
+            post_eval_results.append(rec_job)
+
+        (args.output_dir / "post_eval.json").write_text(json.dumps(post_eval_results, indent=2), encoding="utf-8")
+
     return 0
 
 
