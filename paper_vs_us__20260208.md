@@ -9,6 +9,7 @@ Primary evidence sources (on disk):
 - Our offline suite CSV: `outputs/benchmarks/offline_suite__20260208_192604/benchmark_results.csv`
 - Our suite “best by dataset” (raw acc): `outputs/benchmarks/offline_suite__20260208_192604/benchmark_best_by_dataset__raw_acc.csv`
 - Paper text extracts: `outputs/paper_extract/*.txt`
+- Paper training/protocol checklist (hyperparameter gap analysis): `research/paper_training_recipe_checklist__20260212.md`
 
 Important interpretation (to avoid misleading “apples-to-oranges” comparisons):
 
@@ -62,12 +63,13 @@ Interpretation:
 
 | Dataset | Paper metric (as stated) | Paper protocol notes (quotable) | Our closest matching artifact | Our metric | Comparable? |
 | --- | ---: | --- | --- | ---: | --- |
-| FER2013 (official split; PublicTest/PrivateTest from `fer2013.csv`) | Accuracy: **73.28%** (single network) | “adhere to the official training, validation, and test sets” + “tested using standard ten-crop averaging” + no extra training data | Summary table: `outputs/benchmarks/fer2013_official_summary__20260209/fer2013_official_summary.md` (backed by per-run `reliabilitymetrics.json`) | Best student (DKD_20251229_223722): PublicTest acc **0.613820**, macro-F1 **0.553508**; PrivateTest acc **0.608247**, macro-F1 **0.539047** | **Partial** — official split matches, but protocol mismatch vs paper (paper: ten-crop / TTA; ours: single-crop) |
+| FER2013 (official split; PublicTest/PrivateTest from `fer2013.csv`) | Accuracy: **73.28%** (single network) | “adhere to the official training, validation, and test sets” + “tested using standard ten-crop averaging” + no extra training data | Summary table: `outputs/benchmarks/fer2013_official_summary__20260212/fer2013_official_summary.md` (backed by per-run `reliabilitymetrics.json`) | Best student (DKD_20251229_223722): PublicTest acc **0.614099** (single-crop) / **0.609083** (ten-crop), macro-F1 **0.553776** / **0.557332**; PrivateTest acc **0.608247** / **0.612148**, macro-F1 **0.539025** / **0.547634** | **Partial (closest match)** — split matches and ten-crop is now available; remaining differences may still exist (preprocessing/alignment/model/training) |
 | FER2013 (folder split: `Training_data/FER2013/{train,test}`) | N/A (dataset packaging differs from ICML official split) | Folder-based split (not ten-crop) | `outputs/evals/students/DKD_20251229_223722__fer2013_folder__test__20260208/reliabilitymetrics.json` | DKD_20251229_223722: acc **0.604904**, macro-F1 **0.540220** | **Partial** — same label space, but not the ICML “official train/val/test” protocol; use as an additional controlled benchmark |
 | RAF-DB | Table 5 “Padding” whole-face accuracy: **82.69%** | Paper reports RAF-DB test accuracy with/without padding; “with padding” improves performance | Suite dataset: `test_rafdb_basic` | Best student (CE_20251223_225031): acc **0.862777**, macro-F1 **0.791656** | **Partial** — likely similar label-space, but preprocessing differs (paper uses explicit padding; our pipeline may include CLAHE + cleaned manifests) |
 | FER+ (FERPlus) | Original dataset accuracy: **0.752**; masked-augmented accuracy: **0.747** | Extracted from paper abstract: original 0.752 vs masked augmented 0.747 | Suite dataset: `test_ferplus` | Best student (CE_20251223_225031): acc **0.842224**, macro-F1 **0.738838** | **No** — paper’s dataset variants/protocol differ; also FERPlus label handling can differ across works |
 | ExpW | Table 6 whole-face accuracy: **71.90%** (ExpW testing set) | Paper notes ExpW has worse generalization, likely due to labeling quality | Suite dataset: `expw_full_manifest` | Best student (CE_20251223_225031): acc **0.657697**, macro-F1 **0.482120** | **Partial** — same dataset name family, but label mapping/cropping rules may differ; treat as domain/generalization test |
 | AffectNet | Table 7 (Weighted-Loss) derived macro-F1: **0.625** (Top-1, skew-normalized) | Paper reports per-class F1; our derived macro-F1 is computed in `outputs/paper_extract/affectnet__table7_weightedloss_macro_f1.md` | Suite dataset: `test_affectnet_full_balanced` | Best student (CE_20251223_225031): acc **0.822439**, macro-F1 **0.822597** | **No** — different subset (balanced) and different metric definition/reporting |
+| (Paper pending) Real-time surveillance FER (Transfer Learning, ResNet-50) | TBD (not extracted yet) | Transfer learning with ResNet-50; dataset/split/protocol/metrics pending extraction from PDF | Planned reproduction runner: `scripts/run_student_resnet50_transfer.ps1` (writes stage outputs under `outputs/students/_paper_resnet50_transfer/`) | TBD (will be reported from stored `reliabilitymetrics.json` and post-eval gate artifacts) | **No (pending)** — cannot assess comparability until the paper protocol is extracted and a protocol-matched evaluation is run |
 
 ## Quotes / evidence pointers
 
@@ -94,15 +96,15 @@ AffectNet paper macro-F1 derivation note:
 
 Prereq: you must already have a local Kaggle/ICML `fer2013.csv` (license-restricted).
 
-Status (this workspace, updated 2026-02-09):
+Status (this workspace, updated 2026-02-12):
 
 - Source CSV present: `challenges-in-representation-learning-facial-expression-recognition-challenge/fer2013/fer2013/fer2013.csv`
 - Converted official manifests + images:
   - `Training_data/FER2013_official_from_csv/manifest__publictest.csv` (n=3589)
   - `Training_data/FER2013_official_from_csv/manifest__privatetest.csv` (n=3589)
-- Student eval artifacts (one per model × split) under `outputs/evals/students/fer2013_official__*__*test__20260209/`.
-- Consolidated summary:
-  - `outputs/benchmarks/fer2013_official_summary__20260209/fer2013_official_summary.md`
+- Student eval artifacts (one per model × split × protocol) under `outputs/evals/students/fer2013_official__*__*test__20260212__{singlecrop|tencrop}/`.
+- Consolidated summary (protocol-aware):
+  - `outputs/benchmarks/fer2013_official_summary__20260212/fer2013_official_summary.md`
 
 1) Convert `fer2013.csv` → images + manifest (PublicTest):
 
@@ -120,4 +122,7 @@ If you want PrivateTest too:
 
 - Re-run the converter with `--usage PrivateTest`, then evaluate on `manifest__privatetest.csv`.
 
-If you also want to approximate the paper’s “ten-crop” test-time evaluation, we should add a dedicated evaluation mode (ten-crop) and report it separately, because it is not equivalent to single-crop evaluation.
+If you want to approximate the paper’s “ten-crop” test-time evaluation, use the evaluator’s protocol flag and report it separately:
+
+- Ten-crop command example:
+  - `python scripts/eval_student_checkpoint.py --tta tencrop --checkpoint <CKPT> --eval-manifest Training_data/FER2013_official_from_csv/manifest__publictest.csv --eval-split test --eval-data-root .`
