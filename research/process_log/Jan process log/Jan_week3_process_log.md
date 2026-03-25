@@ -1,0 +1,2 @@
+# Process Log - Week 3 of January 2026
+This document captures the daily activities, decisions, and reflections during the third week of January 2026, focusing on reconstructing the facial expression recognition system as per the established plan.

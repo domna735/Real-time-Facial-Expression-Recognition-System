@@ -65,7 +65,8 @@ Legend: ✅ done / ⚠ partial / ❌ not done
 - DKD baseline experiments: ✅ done (seed=1337 run folder exists)
 - NL module scaffolding: ✅ scaffold exists (`src/fer/nl/`)
 - NegL module scaffolding: ✅ scaffold exists (`src/fer/negl/`)
-- NL + NegL + KD/DKD integration into training: ❌ not done
+- NL + NegL + KD/DKD integration into training: ✅ done (`scripts/train_student.py` supports NL/NegL flags; screening runs exist under `outputs/students/`)
+- NL/NegL screening report (evidence-backed): ✅ done (`research/nl_negl_plan/NL_NegL_report/NL_NegL_report.md`)
 - Hard-case validation set: ❌ not done
 
 ### F) Data / Validation
@@ -164,8 +165,9 @@ In v2-restart right now:
 
 ### 4) NL / NegL are only scaffolds
 
-- Scaffolding files exist, but they are not wired into `scripts/train_student.py` to run real experiments.
-- No NL smoke logs in `outputs/`.
+- NL/NegL are implemented and wired into student training (see `scripts/train_student.py` NL/NegL flags).
+- NL/NegL screening runs exist under `outputs/students/` (including KD/DKD variants with gating and saved `history.json` / `reliabilitymetrics.json`).
+- Remaining gap: deployment-facing evaluation (real-time flip-rate/jitter metrics) is not yet integrated into the experiment loop.
 
 ### 5) Deployment engineering gaps (ONNX FP16 + latency benchmarks)
 
