@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "description": "Domain-shift NegL config for webcam adaptation (safe defaults).",
+  "enabled": false,
+  "policy": {
+    "high_conf": {
+      "pmax_ge": 0.90,
+      "use_as_positive": true
+    },
+    "mid_conf": {
+      "pmax_ge": 0.50,
+      "pmax_lt": 0.90,
+      "use_negl": true
+    },
+    "low_conf": {
+      "pmax_lt": 0.50,
+      "ignore": true
+    }
+  },
+  "negl": {
+    "weight": 0.05,
+    "num_negative_classes": 2,
+    "negative_class_policy": "lowest_prob"
+  },
+  "stability": {
+    "stable_only": true,
+    "min_stable_frames": 3
+  }
+}
